@@ -1,0 +1,313 @@
+//@version=5
+indicator("Liquidity–Value–Momentum Dashboard", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// === Inputs ===
+profileBins = input.int(24, "Volume Profile Bins", minval=8, maxval=100)
+profileLookback = input.int(500, "Max Bars in Session Profile", minval=50, maxval=5000)
+valueAreaPct = input.float(70.0, "Value Area %", minval=50, maxval=90)
+
+londonSession = input.session("0800-1700", "London Session")
+nySession = input.session("1330-2200", "New York Session")
+asiaSession = input.session("0000-0900", "Asia Session")
+inputTz = input.string("Etc/UTC", "Session Timezone")
+
+pivotLen = input.int(3, "Swing Pivot Length", minval=2, maxval=10)
+equalToleranceTicks = input.int(5, "Equal High/Low Tolerance (ticks)", minval=1, maxval=50)
+
+pocBufferTicks = input.int(10, "POC Proximity Buffer (ticks)", minval=1, maxval=100)
+rrTarget = input.float(3.0, "Minimum RR", minval=1.0, maxval=10.0)
+
+// === Session Detection ===
+_inSession(sess) => not na(time(timeframe.period, sess, inputTz))
+
+inLondon = _inSession(londonSession)
+inNY = _inSession(nySession)
+inAsia = _inSession(asiaSession)
+
+sessionActive = (inLondon or inNY) and not inAsia
+sessionStatus = sessionActive ? "✔ SESSION ACTIVE" : "✖ NO TRADE"
+
+// === Daily Change ===
+newDay = ta.change(time("D")) != 0
+
+// === Volume Profile Calculation (daily/session) ===
+var float dayHigh = na
+var float dayLow = na
+var float poc = na
+var float vah = na
+var float val = na
+
+var array<float> dayPrices = array.new_float()
+var array<float> dayVolumes = array.new_float()
+
+if newDay
+    array.clear(dayPrices)
+    array.clear(dayVolumes)
+    dayHigh := na
+    dayLow := na
+
+if not na(close)
+    array.push(dayPrices, close)
+    array.push(dayVolumes, volume)
+    if array.size(dayPrices) > profileLookback
+        array.shift(dayPrices)
+        array.shift(dayVolumes)
+
+if not na(high)
+    dayHigh := na(dayHigh) ? high : math.max(dayHigh, high)
+    dayLow := na(dayLow) ? low : math.min(dayLow, low)
+
+calcProfile(_low, _high, _bins, _prices, _vols) =>
+    float _poc = na
+    float _vah = na
+    float _val = na
+    if _high > _low and array.size(_prices) > 0
+        float _range = _high - _low
+        float _binSize = _range / _bins
+        var array<float> _binVols = array.new_float()
+        array.clear(_binVols)
+        for i = 0 to _bins - 1
+            array.push(_binVols, 0.0)
+        for i = 0 to array.size(_prices) - 1
+            float _price = array.get(_prices, i)
+            float _vol = array.get(_vols, i)
+            int _idx = math.floor((_price - _low) / _binSize)
+            _idx := math.max(0, math.min(_idx, _bins - 1))
+            float _acc = array.get(_binVols, _idx)
+            array.set(_binVols, _idx, _acc + _vol)
+        float _total = 0.0
+        float _maxVol = -1.0
+        int _pocIdx = 0
+        for i = 0 to _bins - 1
+            float _vol = array.get(_binVols, i)
+            _total += _vol
+            if _vol > _maxVol
+                _maxVol := _vol
+                _pocIdx := i
+        float _target = _total * (valueAreaPct / 100.0)
+        float _accum = array.get(_binVols, _pocIdx)
+        int _lowIdx = _pocIdx
+        int _highIdx = _pocIdx
+        while _accum < _target and (_lowIdx > 0 or _highIdx < _bins - 1)
+            float _nextLow = _lowIdx > 0 ? array.get(_binVols, _lowIdx - 1) : -1.0
+            float _nextHigh = _highIdx < _bins - 1 ? array.get(_binVols, _highIdx + 1) : -1.0
+            if _nextHigh >= _nextLow
+                _highIdx += 1
+                _accum += _nextHigh
+            else
+                _lowIdx -= 1
+                _accum += _nextLow
+        _poc := _low + (_pocIdx + 0.5) * _binSize
+        _val := _low + _lowIdx * _binSize
+        _vah := _low + (_highIdx + 1) * _binSize
+    [_poc, _vah, _val]
+
+[profilePoc, profileVah, profileVal] = calcProfile(dayLow, dayHigh, profileBins, dayPrices, dayVolumes)
+poc := profilePoc
+vah := profileVah
+val := profileVal
+
+// === Value Area Status ===
+priceAboveVah = close > vah
+priceBelowVal = close < val
+priceInsideVa = close <= vah and close >= val
+valueContext = priceAboveVah or priceBelowVal
+valueStatus = valueContext ? "✔" : "✖"
+
+// === Liquidity Levels ===
+prevDayHigh = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+prevDayLow = request.security(syminfo.tickerid, "D", low[1], lookahead=barmerge.lookahead_on)
+
+var float asiaHigh = na
+var float asiaLow = na
+
+if newDay
+    asiaHigh := na
+    asiaLow := na
+
+if inAsia
+    asiaHigh := na(asiaHigh) ? high : math.max(asiaHigh, high)
+    asiaLow := na(asiaLow) ? low : math.min(asiaLow, low)
+
+// Equal High/Low detection
+pivotHigh = ta.pivothigh(high, pivotLen, pivotLen)
+pivotLow = ta.pivotlow(low, pivotLen, pivotLen)
+
+var float lastPivotHigh = na
+var float lastPivotLow = na
+var float equalHigh = na
+var float equalLow = na
+
+if not na(pivotHigh)
+    if not na(lastPivotHigh) and math.abs(pivotHigh - lastPivotHigh) <= equalToleranceTicks * syminfo.mintick
+        equalHigh := pivotHigh
+    lastPivotHigh := pivotHigh
+
+if not na(pivotLow)
+    if not na(lastPivotLow) and math.abs(pivotLow - lastPivotLow) <= equalToleranceTicks * syminfo.mintick
+        equalLow := pivotLow
+    lastPivotLow := pivotLow
+
+// Liquidity sweep detection
+sweepHigh(level) => not na(level) and high > level and close < level
+sweepLow(level) => not na(level) and low < level and close > level
+
+pdhSweep = sweepHigh(prevDayHigh)
+pdlSweep = sweepLow(prevDayLow)
+asiaHighSweep = sweepHigh(asiaHigh)
+asiaLowSweep = sweepLow(asiaLow)
+equalHighSweep = sweepHigh(equalHigh)
+equalLowSweep = sweepLow(equalLow)
+
+anySweep = pdhSweep or pdlSweep or asiaHighSweep or asiaLowSweep or equalHighSweep or equalLowSweep
+
+liquidityTouched = (high >= prevDayHigh or low <= prevDayLow) or (high >= asiaHigh or low <= asiaLow) or (high >= equalHigh or low <= equalLow)
+liquidityStatus = (liquidityTouched and anySweep) ? "✔" : (liquidityTouched ? "⏳" : "✖")
+
+// === RSI State ===
+rsiValue = ta.rsi(close, 14)
+
+rsiBuyReversal = rsiValue < 50
+rsiSellReversal = rsiValue > 50
+rsiBuyContinuation = rsiValue >= 55
+rsiSellContinuation = rsiValue <= 45
+
+// === Value Reaction ===
+reversalAccepted = anySweep and priceInsideVa
+continuationAccepted = (close > vah and close[1] > vah) or (close < val and close[1] < val)
+noReturnToVa = not priceInsideVa
+valueAcceptance = (reversalAccepted or (continuationAccepted and noReturnToVa)) ? "✔" : "✖"
+
+// === Market Structure ===
+var float prevSwingHigh = na
+var float prevSwingLow = na
+var float lastSwingHigh = na
+var float lastSwingLow = na
+
+if not na(pivotHigh)
+    prevSwingHigh := lastSwingHigh
+    lastSwingHigh := pivotHigh
+
+if not na(pivotLow)
+    prevSwingLow := lastSwingLow
+    lastSwingLow := pivotLow
+
+bullShift = not na(lastSwingHigh) and not na(prevSwingLow) and close > lastSwingHigh and lastSwingLow > prevSwingLow
+bearShift = not na(lastSwingLow) and not na(prevSwingHigh) and close < lastSwingLow and lastSwingHigh < prevSwingHigh
+
+structureStatus = (bullShift or bearShift) ? "✔" : "✖"
+
+// === Volume Confirmation ===
+volSma = ta.sma(volume, 20)
+volSpike = volume >= volSma * 1.2
+lowPullbackVol = volume < volSma
+
+volumeStatus = volSpike ? "✔" : "✖"
+
+// === Entry Readiness ===
+setupReversal = reversalAccepted
+setupContinuation = continuationAccepted and noReturnToVa
+
+pocBuffer = pocBufferTicks * syminfo.mintick
+priceNotNearPoc = na(poc) ? false : math.abs(close - poc) > pocBuffer
+
+calcRR(_entry, _stop, _target) =>
+    float _risk = math.abs(_entry - _stop)
+    float _reward = math.abs(_target - _entry)
+    _risk > 0 ? _reward / _risk : 0.0
+
+float entryPrice = close
+float stopPrice = setupReversal ? (close > poc ? math.min(low, nz(lastSwingLow, low)) : math.max(high, nz(lastSwingHigh, high))) : (bullShift ? nz(lastSwingLow, low) : nz(lastSwingHigh, high))
+float targetPrice = setupReversal ? (close > poc ? val : vah) : (close > poc ? vah : val)
+
+rrValue = calcRR(entryPrice, stopPrice, targetPrice)
+rrOk = rrValue >= rrTarget
+
+entryReady = sessionActive and valueContext and liquidityTouched and (setupReversal or setupContinuation) and priceNotNearPoc and rrOk
+
+entryStatus = entryReady ? "✔" : "✖"
+
+// === Dashboard ===
+var table dash = table.new(position.top_right, 2, 11, frame_color=color.new(color.gray, 70), frame_width=1)
+
+if barstate.islast
+    table.cell(dash, 0, 0, "SESSION STATUS", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(dash, 1, 0, sessionStatus, text_color=sessionActive ? color.lime : color.red, bgcolor=color.new(color.black, 0))
+
+    table.cell(dash, 0, 1, "VALUE CONTEXT", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(dash, 1, 1, valueStatus, text_color=valueContext ? color.lime : color.red, bgcolor=color.new(color.black, 0))
+
+    table.cell(dash, 0, 2, "LIQUIDITY EVENT", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(dash, 1, 2, liquidityStatus, text_color=liquidityStatus == "✔" ? color.lime : liquidityStatus == "⏳" ? color.orange : color.red, bgcolor=color.new(color.black, 0))
+
+    table.cell(dash, 0, 3, "MOMENTUM (RSI)", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(dash, 1, 3, (rsiBuyReversal or rsiBuyContinuation or rsiSellReversal or rsiSellContinuation) ? "✔" : "✖", text_color=(rsiBuyReversal or rsiBuyContinuation or rsiSellReversal or rsiSellContinuation) ? color.lime : color.red, bgcolor=color.new(color.black, 0))
+
+    table.cell(dash, 0, 4, "VALUE ACCEPTANCE", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(dash, 1, 4, valueAcceptance, text_color=valueAcceptance == "✔" ? color.lime : color.red, bgcolor=color.new(color.black, 0))
+
+    table.cell(dash, 0, 5, "STRUCTURE SHIFT", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(dash, 1, 5, structureStatus, text_color=structureStatus == "✔" ? color.lime : color.red, bgcolor=color.new(color.black, 0))
+
+    table.cell(dash, 0, 6, "VOLUME CONFIRMATION", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(dash, 1, 6, volumeStatus, text_color=volumeStatus == "✔" ? color.lime : color.red, bgcolor=color.new(color.black, 0))
+
+    table.cell(dash, 0, 7, "ENTRY READY", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(dash, 1, 7, entryStatus, text_color=entryReady ? color.lime : color.red, bgcolor=color.new(color.black, 0))
+
+    table.cell(dash, 0, 8, "TRADE STATUS", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(dash, 1, 8, entryReady ? "✔ TRADE ALLOWED" : "✖ NO TRADE", text_color=entryReady ? color.lime : color.red, bgcolor=color.new(color.black, 0))
+
+    table.cell(dash, 0, 9, "SETUP TYPE", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(dash, 1, 9, setupReversal ? "REVERSAL" : setupContinuation ? "CONTINUATION" : "WAIT", text_color=setupReversal or setupContinuation ? color.white : color.orange, bgcolor=color.new(color.black, 0))
+
+    table.cell(dash, 0, 10, "RR", text_color=color.white, bgcolor=color.new(color.black, 0))
+    table.cell(dash, 1, 10, str.tostring(rrValue, "#.##"), text_color=rrOk ? color.lime : color.red, bgcolor=color.new(color.black, 0))
+
+// === Chart Plots ===
+vahPlot = plot(vah, "VAH", color=color.new(color.green, 0), linewidth=1)
+valPlot = plot(val, "VAL", color=color.new(color.red, 0), linewidth=1)
+plot(poc, "POC", color=color.new(color.orange, 0), linewidth=3)
+
+fill(vahPlot, valPlot, color=color.new(color.blue, 90))
+
+plot(prevDayHigh, "PDH", color=color.new(color.green, 60), linewidth=1, style=plot.style_line)
+plot(prevDayLow, "PDL", color=color.new(color.red, 60), linewidth=1, style=plot.style_line)
+plot(asiaHigh, "Asia High", color=color.new(color.teal, 60), linewidth=1, style=plot.style_line)
+plot(asiaLow, "Asia Low", color=color.new(color.teal, 60), linewidth=1, style=plot.style_line)
+plot(equalHigh, "Equal High", color=color.new(color.fuchsia, 60), linewidth=1, style=plot.style_line)
+plot(equalLow, "Equal Low", color=color.new(color.fuchsia, 60), linewidth=1, style=plot.style_line)
+
+barcolor(anySweep ? color.new(color.yellow, 0) : na)
+
+plotshape(anySweep, title="Sweep", style=shape.triangledown, location=location.abovebar, color=color.new(color.yellow, 0), size=size.tiny, text="SW")
+
+// Structure labels
+if bullShift
+    label.new(bar_index, high, "BOS", style=label.style_label_up, color=color.new(color.green, 0), textcolor=color.white)
+if bearShift
+    label.new(bar_index, low, "CHoCH", style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white)
+
+// Entry arrows and SL/TP lines
+var line slLine = na
+var line tp1Line = na
+var line tp2Line = na
+
+if entryReady
+    label.new(bar_index, close, "ENTRY", style=label.style_label_up, color=color.new(color.lime, 0), textcolor=color.black)
+    line.delete(slLine)
+    line.delete(tp1Line)
+    line.delete(tp2Line)
+    slLine := line.new(bar_index, stopPrice, bar_index + 10, stopPrice, color=color.new(color.red, 0), width=2)
+    tp1Line := line.new(bar_index, poc, bar_index + 10, poc, color=color.new(color.orange, 0), width=2)
+    tp2Line := line.new(bar_index, targetPrice, bar_index + 10, targetPrice, color=color.new(color.green, 0), width=2)
+
+// RSI Pane
+rsiPlot = plot(rsiValue, "RSI", color=color.new(color.blue, 0), display=display.pane)
+hline(45, "RSI 45", color=color.new(color.red, 60), linestyle=hline.style_dotted)
+hline(50, "RSI 50", color=color.new(color.gray, 60), linestyle=hline.style_dotted)
+hline(55, "RSI 55", color=color.new(color.green, 60), linestyle=hline.style_dotted)
+
+// Volume coloring
+volColor = volSpike ? color.new(color.lime, 0) : color.new(color.gray, 60)
+plot(volume, "Volume", style=plot.style_columns, color=volColor, display=display.pane)
