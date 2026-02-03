@@ -12,7 +12,9 @@ local function isAdmin(player)
             return true
         end
     end
-    return false
+
+    local hasPermission = QBCore.Functions.HasPermission(player.PlayerData.source, 'admin')
+    return hasPermission == true
 end
 
 local function getStation(stationId)
